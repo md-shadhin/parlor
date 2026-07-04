@@ -649,6 +649,17 @@ function connect() {
       streamTtsTime = msg.tts_time;
       const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
       if (meta) meta.textContent += ` · TTS ${msg.tts_time}s`;
+    } else if (msg.type === 'error') {
+      // A turn failed on the server: show the message and unstick the UI
+      // (otherwise it stays on "ভাবছি…" forever).
+      const userMsgs = messagesDiv.querySelectorAll('.msg.user');
+      const lastUserMsg = userMsgs[userMsgs.length - 1];
+      if (lastUserMsg && lastUserMsg.querySelector('.loading-dots')) lastUserMsg.remove();
+      addMessage('assistant', msg.message || 'দুঃখিত, একটি সমস্যা হয়েছে।');
+      ignoreIncomingAudio = false;
+      stopPlayback();
+      setState('listening');
+      setStatus('connected', 'সংযুক্ত');
     }
   };
 }

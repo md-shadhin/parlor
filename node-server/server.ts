@@ -144,7 +144,13 @@ wss.on('connection', (ws: WebSocket) => {
     } catch (err) {
       if (!signal.aborted && errName(err) !== 'AbortError') console.error('TTS error:', errMessage(err));
     }
-    if (signal.aborted || !audioB64) return;
+    if (signal.aborted) return;
+    if (!audioB64) {
+      // The text reply was already delivered but speech synthesis failed. Tell
+      // the client so it leaves "processing" instead of hanging there.
+      send({ type: 'error', message: 'দুঃখিত, কণ্ঠ তৈরি করা যায়নি।' });
+      return;
+    }
 
     const ttsTime = (Date.now() - ttsStart) / 1000;
     console.log(`TTS (${ttsTime.toFixed(2)}s)`);
