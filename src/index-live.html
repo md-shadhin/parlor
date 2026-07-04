@@ -420,7 +420,7 @@
     <div class="logo-mark"></div>
     <h1>পার্লার</h1>
   </div>
-  <span class="model-label">Gemini + Microsoft Edge TTS</span>
+  <span class="model-label">Gemini</span>
   <div id="status" class="status-pill disconnected">সংযোগ নেই</div>
 </header>
 
@@ -453,8 +453,6 @@
   </div>
 </div>
 
-<script src="/vendor/onnx/ort.min.js"></script>
-<script src="/vendor/vad/bundle.min.js"></script>
 <script>
 const $ = id => document.getElementById(id);
 const video = $('video'), cameraToggle = $('cameraToggle');
@@ -464,20 +462,20 @@ const viewportWrap = $('viewportWrap');
 const waveformCanvas = $('waveform');
 const waveformCtx = waveformCanvas.getContext('2d');
 
-let ws, mediaStream, myvad;
+let ws, mediaStream;
 let cameraEnabled = true;
-let audioCtx, currentSource;
 let state = 'loading';
-let ignoreIncomingAudio = false;
 
-// Streaming audio playback state
-let streamSampleRate = 24000;
-let streamNextTime = 0;         // When to schedule next chunk
-let streamSources = [];         // Active AudioBufferSourceNodes
-let streamTtsTime = null;
+// Audio: separate contexts for capture (16 kHz, what Live wants) and playback
+// (24 kHz PCM from the model). Each has its own analyser feeding the waveform.
+let captureCtx, playbackCtx, workletNode;
+let micAnalyser = null, playbackAnalyser = null, analyser = null;
+
+// Streaming playback state
+let streamNextTime = 0;
+let streamSources = [];
 
 // ── Waveform Visualizer ──
-let analyser, micSource;
 const BAR_COUNT = 40;
 const BAR_GAP = 3;
 let waveformRAF;
@@ -593,23 +591,13 @@ function setState(newState) {
   // Kick off speaking glow animation
   if (newState === 'speaking') requestAnimationFrame(updateSpeakingGlow);
 
-  // Raise VAD threshold during speaking to reduce echo false triggers
-  if (myvad) {
-    myvad.setOptions({ positiveSpeechThreshold: newState === 'speaking' ? 0.92 : 0.5 });
-  }
-
-  // Connect/disconnect mic analyser based on state
-  if (newState === 'listening' && mediaStream && audioCtx && analyser) {
-    if (!micSource) {
-      micSource = audioCtx.createMediaStreamSource(mediaStream);
-    }
-    try { micSource.connect(analyser); } catch {}
-  } else if (micSource && newState !== 'listening') {
-    try { micSource.disconnect(analyser); } catch {}
-  }
+  // Point the visualizer at the active source: model audio while speaking,
+  // the microphone otherwise.
+  if (newState === 'speaking') analyser = playbackAnalyser || analyser;
+  else analyser = micAnalyser || analyser;
 }
 
-// ── WebSocket ──
+// ── WebSocket (Gemini Live proxy) ──
 function connect() {
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
   ws.onopen = () => {
@@ -622,33 +610,27 @@ function connect() {
   };
   ws.onmessage = ({ data }) => {
     const msg = JSON.parse(data);
-    if (msg.type === 'text') {
-      if (msg.transcription) {
-        const userMsgs = messagesDiv.querySelectorAll('.msg.user');
-        const lastUserMsg = userMsgs[userMsgs.length - 1];
-        if (lastUserMsg) {
-          const meta = lastUserMsg.querySelector('.meta');
-          lastUserMsg.innerHTML = `${msg.transcription}${meta ? meta.outerHTML : ''}`;
-        }
-      }
-      addMessage('assistant', msg.text, `LLM ${msg.llm_time}s`);
-    } else if (msg.type === 'audio_start') {
-      if (ignoreIncomingAudio) return;
-      streamSampleRate = msg.sample_rate || 24000;
-      startStreamPlayback();
-    } else if (msg.type === 'audio_chunk') {
-      if (ignoreIncomingAudio) return;
-      queueAudioChunk(msg.audio, msg.format);
-    } else if (msg.type === 'audio_end') {
-      if (ignoreIncomingAudio) {
-        ignoreIncomingAudio = false;
+    switch (msg.type) {
+      case 'audio':
+        playChunk(msg.data);
+        break;
+      case 'input_transcription':
+        onUserTurn(); // signal only — the transcribed text is unreliable, so unused
+        break;
+      case 'output_transcription':
+        onOutputTranscription(msg.text);
+        break;
+      case 'interrupted':
         stopPlayback();
+        finalizeTurn();
         setState('listening');
-        return;
-      }
-      streamTtsTime = msg.tts_time;
-      const meta = messagesDiv.querySelector('.msg.assistant:last-child .meta');
-      if (meta) meta.textContent += ` · TTS ${msg.tts_time}s`;
+        break;
+      case 'turn_complete':
+        finalizeTurn();
+        break;
+      case 'error':
+        stateText.textContent = msg.message;
+        break;
     }
   };
 }
@@ -682,158 +664,157 @@ function captureFrame() {
   const scale = 320 / video.videoWidth;
   canvas.width = 320; canvas.height = video.videoHeight * scale;
   canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-  return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+  return canvas.toDataURL('image/jpeg', 0.6).split(',')[1];
 }
 
-// ── VAD Handlers ──
-let speakingStartedAt = 0;
-const BARGE_IN_GRACE_MS = 800; // Ignore VAD triggers shortly after TTS starts (echo)
-
-function handleSpeechStart() {
-  if (state === 'speaking') {
-    // Ignore echo: don't allow barge-in right after TTS starts playing
-    if (Date.now() - speakingStartedAt < BARGE_IN_GRACE_MS) {
-      console.log('Barge-in suppressed (echo grace period)');
-      return;
+// ── Continuous mic capture → 16 kHz Int16 PCM via AudioWorklet ──
+const WORKLET_SRC = `
+class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() { super(); this.buf = []; this.target = 2048; }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch) {
+      for (let i = 0; i < ch.length; i++) this.buf.push(ch[i]);
+      while (this.buf.length >= this.target) {
+        const slice = this.buf.splice(0, this.target);
+        const pcm = new Int16Array(this.target);
+        for (let i = 0; i < this.target; i++) {
+          const s = Math.max(-1, Math.min(1, slice[i]));
+          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        this.port.postMessage(pcm.buffer, [pcm.buffer]);
+      }
     }
-    stopPlayback();
-    ignoreIncomingAudio = true;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: 'interrupt' }));
-    }
-    setState('listening');
-    console.log('Barge-in: interrupted playback');
+    return true;
   }
 }
+registerProcessor('capture', CaptureProcessor);
+`;
 
-function handleSpeechEnd(audio) {
-  if (state !== 'listening') return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-
-  const wavBase64 = float32ToWavBase64(audio);
-  const imageBase64 = captureFrame();
-
-  setState('processing');
-  setStatus('processing', 'প্রসেসিং');
-  addMessage('user', '<span class="loading-dots"><span></span><span></span><span></span></span>', imageBase64 ? 'ক্যামেরাসহ' : '');
-
-  const payload = { audio: wavBase64 };
-  if (imageBase64) payload.image = imageBase64;
-  ws.send(JSON.stringify(payload));
-}
-
-// ── Float32 @ 16kHz → WAV base64 ──
-function float32ToWavBase64(samples) {
-  const buf = new ArrayBuffer(44 + samples.length * 2);
-  const v = new DataView(buf);
-  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-  w(0,'RIFF'); v.setUint32(4, 36 + samples.length * 2, true); w(8,'WAVE'); w(12,'fmt ');
-  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true);
-  v.setUint16(34, 16, true); w(36,'data'); v.setUint32(40, samples.length * 2, true);
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-  }
-  const bytes = new Uint8Array(buf);
-  let bin = ''; for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+function abToBase64(ab) {
+  const bytes = new Uint8Array(ab);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
   return btoa(bin);
 }
 
-// ── Streaming Playback ──
+async function setupCapture() {
+  // Force a 16 kHz context so the worklet emits exactly the rate Live expects.
+  captureCtx = new AudioContext({ sampleRate: 16000 });
+  micAnalyser = captureCtx.createAnalyser();
+  micAnalyser.fftSize = 256;
+  micAnalyser.smoothingTimeConstant = 0.75;
+
+  const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+  await captureCtx.audioWorklet.addModule(URL.createObjectURL(blob));
+
+  const source = captureCtx.createMediaStreamSource(new MediaStream(mediaStream.getAudioTracks()));
+  workletNode = new AudioWorkletNode(captureCtx, 'capture');
+  const mute = captureCtx.createGain();
+  mute.gain.value = 0; // pull the graph without echoing the mic to speakers
+
+  source.connect(micAnalyser);              // drives the "listening" waveform
+  source.connect(workletNode).connect(mute).connect(captureCtx.destination);
+
+  workletNode.port.onmessage = (e) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'audio', data: abToBase64(e.data) }));
+    }
+  };
+}
+
+function setupPlayback() {
+  playbackCtx = new AudioContext();
+  playbackAnalyser = playbackCtx.createAnalyser();
+  playbackAnalyser.fftSize = 256;
+  playbackAnalyser.smoothingTimeConstant = 0.75;
+}
+
+// ── Streaming playback (24 kHz PCM from the model) ──
 function stopPlayback() {
   for (const src of streamSources) {
     try { src.stop(); } catch {}
   }
   streamSources = [];
-  currentSource = null;
   streamNextTime = 0;
 }
 
-function ensureAudioCtx() {
-  if (!audioCtx) {
-    audioCtx = new AudioContext();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 256;
-    analyser.smoothingTimeConstant = 0.75;
-  }
-}
+function playChunk(base64Pcm) {
+  if (!playbackCtx) return;
 
-function startStreamPlayback() {
-  stopPlayback();
-  ensureAudioCtx();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-  streamNextTime = audioCtx.currentTime + 0.05; // Small initial buffer
-  speakingStartedAt = Date.now();
-  setState('speaking');
-}
-
-// Chunks arrive as compressed MP3 (from the Edge-TTS backend, flagged
-// format: 'mp3') or, as a fallback, raw Int16 PCM. MP3 needs async decoding,
-// so we chain decodes through a queue to keep them in order.
-let decodeQueue = Promise.resolve();
-
-function queueAudioChunk(base64Audio, format) {
-  ensureAudioCtx();
-
-  const bin = atob(base64Audio);
+  const bin = atob(base64Pcm);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-
-  if (format === 'mp3') {
-    decodeQueue = decodeQueue
-      .then(() => audioCtx.decodeAudioData(bytes.buffer))
-      .then(buf => scheduleBuffer(buf))
-      .catch(e => console.warn('Audio decode failed:', e));
-    return;
-  }
-
-  // Raw Int16 PCM -> Float32
   const int16 = new Int16Array(bytes.buffer);
   const float32 = new Float32Array(int16.length);
   for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
 
-  const audioBuffer = audioCtx.createBuffer(1, float32.length, streamSampleRate);
+  const audioBuffer = playbackCtx.createBuffer(1, float32.length, 24000);
   audioBuffer.getChannelData(0).set(float32);
-  scheduleBuffer(audioBuffer);
-}
 
-function scheduleBuffer(audioBuffer) {
-  if (state !== 'speaking') return; // barge-in happened while decoding
-
-  const source = audioCtx.createBufferSource();
+  const source = playbackCtx.createBufferSource();
   source.buffer = audioBuffer;
-  source.connect(audioCtx.destination);
-  source.connect(analyser);
+  source.connect(playbackCtx.destination);
+  source.connect(playbackAnalyser);         // drives the "speaking" waveform + glow
 
-  // Schedule gapless playback
-  const startAt = Math.max(streamNextTime, audioCtx.currentTime);
+  const startAt = Math.max(streamNextTime, playbackCtx.currentTime);
   source.start(startAt);
   streamNextTime = startAt + audioBuffer.duration;
-
   streamSources.push(source);
-  currentSource = source;
 
-  // Clean up when this chunk finishes
+  if (state !== 'speaking') setState('speaking');
+
   source.onended = () => {
     const idx = streamSources.indexOf(source);
     if (idx !== -1) streamSources.splice(idx, 1);
-    // If this was the last chunk and no more are queued, return to listening
+    // When the model's audio has fully drained, return to listening.
     if (streamSources.length === 0 && state === 'speaking') {
-      currentSource = null;
       setState('listening');
       setStatus('connected', 'সংযুক্ত');
     }
   };
 }
 
-// ── UI ──
-function addMessage(role, text, meta) {
+// ── Transcript ──
+// The Live API's user-side transcription (inputAudioTranscription) is unreliable
+// — a known Gemini bug: it returns garbled/random text even though the model
+// understands the audio perfectly. So we don't render it. Each user turn shows a
+// clean voice indicator (a mic glyph + "ক্যামেরাসহ" when the camera is on); the
+// input-transcription event is used only as the "user is speaking" signal. The
+// assistant's reply (which IS accurate) streams into its own bubble.
+let userBubble = null;
+let asstBubble = null;
+
+const MIC_SVG =
+  '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" ' +
+  'stroke-width="1.5" style="vertical-align:-2px"><rect x="6" y="2" width="4" height="7" rx="2"/>' +
+  '<path d="M4 8a4 4 0 0 0 8 0"/><path d="M8 12v2"/></svg>';
+
+function addMessage(role, html, meta) {
   const div = document.createElement('div');
   div.className = `msg ${role}`;
-  div.innerHTML = `${text}${meta ? `<div class="meta">${meta}</div>` : ''}`;
+  div.innerHTML = `${html}${meta ? `<div class="meta">${meta}</div>` : ''}`;
   messagesDiv.appendChild(div);
   messagesDiv.scrollTop = messagesDiv.scrollHeight;
+  return div;
+}
+
+// A user turn began — show a voice indicator (the transcription is not shown).
+function onUserTurn() {
+  if (!userBubble) {
+    userBubble = addMessage('user', `${MIC_SVG} ভয়েস`, cameraEnabled ? 'ক্যামেরাসহ' : '');
+  }
+}
+
+function onOutputTranscription(text) {
+  if (!asstBubble) asstBubble = addMessage('assistant', '', '');
+  asstBubble.textContent += text;
+  messagesDiv.scrollTop = messagesDiv.scrollHeight;
+}
+
+function finalizeTurn() {
+  userBubble = null;
+  asstBubble = null;
 }
 
 cameraToggle.addEventListener('click', () => {
@@ -849,44 +830,34 @@ async function init() {
   window.addEventListener('resize', initWaveformCanvas);
 
   await startCamera();
+  await setupCapture();
+  setupPlayback();
   connect();
 
-  // Initialize VAD with shared mic stream
-  myvad = await vad.MicVAD.new({
-    getStream: async () => new MediaStream(mediaStream.getAudioTracks()),
-    positiveSpeechThreshold: 0.5,
-    negativeSpeechThreshold: 0.25,
-    redemptionMs: 600,
-    minSpeechMs: 300,
-    preSpeechPadMs: 300,
-    onSpeechStart: handleSpeechStart,
-    onSpeechEnd: handleSpeechEnd,
-    onVADMisfire: () => { console.log('VAD misfire (too short)'); },
-    onnxWASMBasePath: "/vendor/onnx/",
-    baseAssetPath: "/vendor/vad/",
-  });
+  // Stream a camera frame ~once per second (respects the camera toggle).
+  setInterval(() => {
+    const frame = captureFrame();
+    if (frame && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'video', data: frame }));
+    }
+  }, 1000);
 
-  myvad.start();
-
-  // Init audio context on first user gesture for mic visualizer
-  // (browsers require user interaction to create AudioContext)
-  const initAudio = () => {
-    ensureAudioCtx();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    document.removeEventListener('click', initAudio);
-    document.removeEventListener('keydown', initAudio);
+  // Browsers require a user gesture to start audio; resume both contexts on the
+  // first interaction (getUserMedia often satisfies this already).
+  const resumeAudio = () => {
+    if (captureCtx && captureCtx.state === 'suspended') captureCtx.resume();
+    if (playbackCtx && playbackCtx.state === 'suspended') playbackCtx.resume();
+    document.removeEventListener('click', resumeAudio);
+    document.removeEventListener('keydown', resumeAudio);
   };
-  document.addEventListener('click', initAudio);
-  document.addEventListener('keydown', initAudio);
-  // Also try immediately (may work if page had prior interaction)
-  ensureAudioCtx();
+  document.addEventListener('click', resumeAudio);
+  document.addEventListener('keydown', resumeAudio);
+  resumeAudio();
 
   setState('listening');
-
-  // Start waveform loop
   drawWaveform();
 
-  console.log('VAD initialized and listening');
+  console.log('Live: streaming and listening');
 }
 
 init();
